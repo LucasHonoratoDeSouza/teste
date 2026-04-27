@@ -14,24 +14,31 @@ from config import (
     LOCK_PROFIT_BID,
     LOCK_PROFIT_TIME_TO_EXPIRY_SECONDS,
     MAX_ENTRY_PRICE,
+    MAX_ENTRY_TIME_TO_EXPIRY_SECONDS,
     MAX_SPREAD_PERCENT,
     MAX_OPEN_BETS_PER_MARKET,
     MAX_OPEN_BETS_PER_OUTCOME,
     MAX_OPEN_RISK_PER_MARKET_USD,
+    MAX_TRADES_PER_MARKET,
     MIN_EDGE,
     MIN_ENTRY_TIME_TO_EXPIRY_SECONDS,
     MIN_HOLD_BEFORE_SELL_SECONDS,
+    MODEL_MARKET_BLEND,
+    MODEL_PROBABILITY_CLIP_MAX,
+    MODEL_PROBABILITY_CLIP_MIN,
     ONLINE_CALIBRATION_ENABLED,
     ONLINE_CALIBRATION_MIN_ROUNDS,
     ONLINE_CALIBRATION_MIN_SAMPLES,
+    ONLINE_CALIBRATION_SAMPLE_SECONDS,
     ONLINE_CALIBRATION_WINDOW_SAMPLES,
     PAPER_BANKROLL_USD,
     SELL_OVERPRICED_EDGE,
     SELL_OVERPRICED_ENABLED,
     SELL_OVERPRICED_MIN_PNL_USD,
+    TAKER_FEE_RATE,
 )
 from data_engine import DataEngine, utc_now
-from features import FeatureEngineer
+from features import FeatureEngineer, MODEL_FEATURE_COLUMNS
 
 
 class ForwardTestEngine:
@@ -63,6 +70,7 @@ class ForwardTestEngine:
         self.live_calibration_rounds = set()
         self.live_calibration_generation = 0
         self.last_live_calibration_generation = -1
+        self._last_calibration_sample_at = {}
 
         self._ensure_csv()
 
@@ -179,11 +187,11 @@ class ForwardTestEngine:
                     )
                     continue
 
-                feature_array = np.array(features.values, dtype=np.float32)
+                feature_array = np.array(features[MODEL_FEATURE_COLUMNS].values, dtype=np.float32)
                 feature_tensor = torch.tensor(feature_array).unsqueeze(0)
                 raw_p_up = float(self.model.predict_raw_proba(feature_tensor)[0])
-                p_up_model = float(self.model.calibrate_raw_proba([raw_p_up])[0])
-                p_up_model = float(np.clip(p_up_model, 0.001, 0.999))
+                signal_p_up = float(self.model.calibrate_raw_proba([raw_p_up])[0])
+                p_up_model = self._blend_market_and_model_prob(signal_p_up, up_quote.mid)
                 self._record_live_calibration_sample(now, raw_p_up)
 
                 self._manage_open_positions(now, p_up_model)
@@ -193,14 +201,14 @@ class ForwardTestEngine:
                         "direction": "UP",
                         "p_model": p_up_model,
                         "cost": up_quote.best_ask,
-                        "ev": p_up_model - up_quote.best_ask,
+                        "ev": self._net_edge_per_share(p_up_model, up_quote.best_ask),
                         "quote": up_quote,
                     },
                     {
                         "direction": "DOWN",
                         "p_model": 1.0 - p_up_model,
                         "cost": down_quote.best_ask,
-                        "ev": (1.0 - p_up_model) - down_quote.best_ask,
+                        "ev": self._net_edge_per_share(1.0 - p_up_model, down_quote.best_ask),
                         "quote": down_quote,
                     },
                 ]
@@ -247,6 +255,24 @@ class ForwardTestEngine:
             or down_quote.spread > MAX_SPREAD_PERCENT
         )
 
+    def _blend_market_and_model_prob(self, signal_prob, market_mid):
+        if market_mid is None:
+            blended = signal_prob
+        else:
+            blended = market_mid + MODEL_MARKET_BLEND * (signal_prob - market_mid)
+        return float(np.clip(blended, MODEL_PROBABILITY_CLIP_MIN, MODEL_PROBABILITY_CLIP_MAX))
+
+    def _fee_per_share(self, price):
+        if price is None:
+            return 0.0
+        return TAKER_FEE_RATE * price * (1.0 - price)
+
+    def _taker_fee_usd(self, shares, price):
+        return float(shares) * self._fee_per_share(price)
+
+    def _net_edge_per_share(self, model_prob, entry_price):
+        return float(model_prob) - float(entry_price) - self._fee_per_share(entry_price)
+
     def _try_open_paper_bet(self, now, candidate, features):
         block_reason = self._entry_block_reason(candidate, features)
         if block_reason:
@@ -259,17 +285,19 @@ class ForwardTestEngine:
         target_stake = min(target_stake, self._remaining_market_risk(candidate["direction"]))
         target_stake = max(target_stake, min_shares * candidate["cost"])
 
-        max_fill_price = min(MAX_ENTRY_PRICE, candidate["p_model"] - MIN_EDGE)
+        max_fill_price = min(MAX_ENTRY_PRICE, candidate["p_model"] - MIN_EDGE - self._fee_per_share(candidate["cost"]))
         fill = candidate["quote"].estimate_buy(target_stake, max_price=max_fill_price)
         if fill["shares"] < min_shares:
             return False, "liquidez insuficiente no ask dentro do preço máximo"
 
-        stake = float(fill["cost"])
+        gross_cost = float(fill["cost"])
         shares = float(fill["shares"])
         avg_price = float(fill["avg_price"])
-        realized_ev = candidate["p_model"] - avg_price
+        entry_fee = self._taker_fee_usd(shares, avg_price)
+        stake = gross_cost + entry_fee
+        realized_ev = self._net_edge_per_share(candidate["p_model"], avg_price)
         if realized_ev <= MIN_EDGE:
-            return False, "EV caiu após simular fill pelo book"
+            return False, "EV liquido caiu apos simular fill pelo book"
 
         bet = {
             "timestamp": now,
@@ -283,6 +311,8 @@ class ForwardTestEngine:
             "P_mkt_paid": avg_price,
             "EV": realized_ev,
             "bet_size_USD": stake,
+            "gross_cost_USD": gross_cost,
+            "entry_fee_USD": entry_fee,
             "shares": shares,
             "status": "OPEN",
         }
@@ -291,16 +321,18 @@ class ForwardTestEngine:
         print(
             f"\n[PAPER TRADE ABERTO] {now.strftime('%H:%M:%S')} UTC | "
             f"{bet['direction']} | cost ask={bet['P_mkt_paid']:.3f} | "
-            f"model={bet['P_model']:.2%} | EV={bet['EV']:.2%} | stake=${stake:.2f} | "
+            f"model={bet['P_model']:.2%} | EVliq={bet['EV']:.2%} | stake=${stake:.2f} | "
             f"shares={shares:.2f} | slug={bet['market_slug']}"
         )
         return True, None
 
     def _entry_block_reason(self, candidate, features):
         if candidate["ev"] <= MIN_EDGE:
-            return f"sem edge suficiente ({candidate['ev']:.2%})"
+            return f"sem edge liquido suficiente ({candidate['ev']:.2%})"
         if features["time_to_expiry"] < MIN_ENTRY_TIME_TO_EXPIRY_SECONDS:
             return f"muito perto do vencimento ({features['time_to_expiry']:.0f}s)"
+        if features["time_to_expiry"] > MAX_ENTRY_TIME_TO_EXPIRY_SECONDS:
+            return f"cedo demais na rodada ({features['time_to_expiry']:.0f}s)"
         if candidate["cost"] >= MAX_ENTRY_PRICE:
             return f"entrada cara demais ({candidate['cost']:.3f})"
         if candidate["quote"].best_ask_size < self.data_engine.order_min_size:
@@ -309,20 +341,32 @@ class ForwardTestEngine:
             return "limite de posições abertas na rodada"
         if self._open_count_for_outcome(candidate["direction"]) >= MAX_OPEN_BETS_PER_OUTCOME:
             return f"já existe posição aberta em {candidate['direction']}"
+        if self._trade_count_for_market() >= MAX_TRADES_PER_MARKET:
+            return "ja houve trade suficiente nesta rodada"
         min_stake = self.data_engine.order_min_size * candidate["cost"]
         if self._remaining_market_risk(candidate["direction"]) < min_stake:
             return "limite de risco aberto na rodada"
         return None
 
     def _kelly_stake(self, p_win, cost):
-        if cost <= 0 or cost >= 1:
+        effective_cost = cost + self._fee_per_share(cost)
+        if effective_cost <= 0 or effective_cost >= 1:
             return 0.0
-        full_kelly = (p_win - cost) / (1.0 - cost)
+        full_kelly = (p_win - effective_cost) / (1.0 - effective_cost)
         fractional_kelly = max(0.0, min(0.20, full_kelly * KELLY_FRACTION))
         return PAPER_BANKROLL_USD * fractional_kelly
 
     def _open_count_for_market(self):
         return len([bet for bet in self.active_bets if bet["market_slug"] == self.data_engine.market_slug])
+
+    def _trade_count_for_market(self):
+        return len(
+            [
+                bet
+                for bet in self.active_bets + self.completed_bets
+                if bet["market_slug"] == self.data_engine.market_slug
+            ]
+        )
 
     def _open_count_for_outcome(self, direction):
         return len([
@@ -359,17 +403,21 @@ class ForwardTestEngine:
                 continue
 
             exit_bid = float(sell_fill["avg_price"])
-            pnl = float(sell_fill["proceeds"]) - bet["bet_size_USD"]
+            exit_fee = self._taker_fee_usd(sell_fill["shares"], exit_bid)
+            net_proceeds = float(sell_fill["proceeds"]) - exit_fee
+            exit_bid_net = net_proceeds / sell_fill["shares"]
+            pnl = net_proceeds - bet["bet_size_USD"]
             seconds_left = max(0.0, (bet["round_expiry"] - now).total_seconds())
             held_seconds = (now - bet["timestamp"]).total_seconds()
-            reason = self._early_exit_reason(bet, held_model_prob, exit_bid, pnl, seconds_left, held_seconds)
+            reason = self._early_exit_reason(bet, held_model_prob, exit_bid_net, pnl, seconds_left, held_seconds)
             if reason is None:
                 continue
 
             bet["status"] = reason
             bet["close_price"] = self.data_engine.current_btc_price
             bet["pnl"] = pnl
-            bet["exit_price"] = exit_bid
+            bet["exit_price"] = exit_bid_net
+            bet["exit_fee_USD"] = exit_fee
             bet["exit_timestamp"] = now
 
             self.completed_bets.append(bet)
@@ -378,7 +426,7 @@ class ForwardTestEngine:
 
             print(
                 f"\n[PAPER TRADE VENDIDO] {now.strftime('%H:%M:%S')} UTC | "
-                f"{bet['direction']} | bid médio={exit_bid:.3f} | pago={bet['P_mkt_paid']:.3f} | "
+                f"{bet['direction']} | bid liquido={exit_bid_net:.3f} | pago={bet['P_mkt_paid']:.3f} | "
                 f"model={held_model_prob:.2%} | {reason} | PnL=${pnl:.2f}"
             )
 
@@ -448,6 +496,10 @@ class ForwardTestEngine:
         if self.data_engine.market_slug is None or self.data_engine.round_expiry is None or self.data_engine.S0 is None:
             return
 
+        last_sample_at = self._last_calibration_sample_at.get(self.data_engine.market_slug)
+        if last_sample_at is not None and (now - last_sample_at).total_seconds() < ONLINE_CALIBRATION_SAMPLE_SECONDS:
+            return
+
         slug = self.data_engine.market_slug
         self.pending_calibration_samples.setdefault(slug, {
             "round_expiry": self.data_engine.round_expiry,
@@ -459,6 +511,7 @@ class ForwardTestEngine:
             "timestamp": now,
             "raw_p_up": raw_p_up,
         })
+        self._last_calibration_sample_at[slug] = now
 
     def _resolve_live_calibration_samples(self, now):
         if not ONLINE_CALIBRATION_ENABLED or not self.pending_calibration_samples:
@@ -490,6 +543,7 @@ class ForwardTestEngine:
 
         for slug in resolved_slugs:
             del self.pending_calibration_samples[slug]
+            self._last_calibration_sample_at.pop(slug, None)
 
         if resolved_slugs:
             self.live_calibration_generation += 1
@@ -574,7 +628,7 @@ class ForwardTestEngine:
             f"[{now.strftime('%H:%M:%S')}] T={features['time_to_expiry']:.0f}s | "
             f"Chainlink={self.data_engine.current_btc_price:.2f} vs S0={self.data_engine.S0:.2f} | "
             f"Model UP={p_up_model:.2%} | UP ask={up_quote.best_ask:.3f} DOWN ask={down_quote.best_ask:.3f} | "
-            f"Best={best['direction']} EV={best['ev']:.2%}{block_suffix}"
+            f"Best={best['direction']} EVliq={best['ev']:.2%}{block_suffix}"
         )
 
     def _print_performance_report(self):

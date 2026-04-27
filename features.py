@@ -1,6 +1,22 @@
 import pandas as pd
 import numpy as np
 
+
+MODEL_FEATURE_COLUMNS = [
+    'time_to_expiry',
+    'distance_to_strike',
+    'obi',
+    'log_return_10s',
+    'volatility_10s',
+    'log_return_30s',
+    'volatility_30s',
+    'log_return_60s',
+    'volatility_60s',
+    'log_return_300s',
+    'volatility_300s',
+]
+
+
 class FeatureEngineer:
     def __init__(self):
         self.price_history = []

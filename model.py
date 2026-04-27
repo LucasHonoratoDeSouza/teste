@@ -1,10 +1,19 @@
+import os
+
+import joblib
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.calibration import IsotonicRegression
-import numpy as np
-import os
-import joblib
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+from features import MODEL_FEATURE_COLUMNS
+
+
+MODEL_BUNDLE_PATH = "model_bundle.pkl"
+MODEL_WEIGHTS_PATH = "model_weights.pth"
+CALIBRATOR_PATH = "calibrator.pkl"
 
 class ProfitAwareLoss(nn.Module):
     def __init__(self):
@@ -45,9 +54,12 @@ class QuantMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 class ModelEngine:
-    def __init__(self, input_dim, lr=1e-3, weight_decay=1e-3):
+    def __init__(self, input_dim, lr=1e-3, weight_decay=1e-3, load_existing=True):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = QuantMLP(input_dim).to(self.device)
+        self.base_model = None
+        self.model_type = "torch"
+        self.feature_columns = list(MODEL_FEATURE_COLUMNS)
         self.criterion = ProfitAwareLoss()
         
         # Otimizador AdamW
@@ -56,13 +68,21 @@ class ModelEngine:
         # Calibrador
         self.calibrator = IsotonicRegression(out_of_bounds='clip')
         
-        # Carrega pesos se existirem
-        if os.path.exists("model_weights.pth"):
-            self.model.load_state_dict(torch.load("model_weights.pth", map_location=self.device, weights_only=True))
-            print("🧠 Pesos da Rede Neural carregados com sucesso!")
+        if load_existing and os.path.exists(MODEL_BUNDLE_PATH):
+            bundle = joblib.load(MODEL_BUNDLE_PATH)
+            self.base_model = bundle["model"]
+            self.model_type = bundle.get("model_type", "sklearn")
+            self.feature_columns = bundle.get("feature_columns", list(MODEL_FEATURE_COLUMNS))
+            print("🧠 Modelo tabular carregado com sucesso!")
+        elif load_existing and os.path.exists(MODEL_WEIGHTS_PATH):
+            try:
+                self.model.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=self.device, weights_only=True))
+                print("🧠 Pesos da Rede Neural carregados com sucesso!")
+            except RuntimeError:
+                print("⚠️ Pesos legados incompatíveis com o novo conjunto de features; ignorando checkpoint torch.")
             
-        if os.path.exists("calibrator.pkl"):
-            self.calibrator = joblib.load("calibrator.pkl")
+        if load_existing and os.path.exists(CALIBRATOR_PATH):
+            self.calibrator = joblib.load(CALIBRATOR_PATH)
             print("🎯 Calibrador Isotonic Regression carregado com sucesso!")
         
     def train_epoch(self, X, y, p_mkt, batch_size=256):
@@ -94,12 +114,43 @@ class ModelEngine:
         return total_loss / (X.size()[0] / batch_size)
         
     def fit_calibrator(self, X_val, y_val):
-        self.model.eval()
-        with torch.no_grad():
-            preds = self.model(X_val.to(self.device)).cpu().numpy()
+        preds = self.predict_raw_proba(X_val)
         self.calibrator.fit(preds, y_val.numpy())
 
+    def fit_sklearn_model(self, X, y, sample_weight=None):
+        self.base_model = HistGradientBoostingClassifier(
+            max_depth=3,
+            learning_rate=0.05,
+            max_iter=200,
+            min_samples_leaf=50,
+            l2_regularization=1.0,
+            random_state=42,
+        )
+        self.base_model.fit(np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32), sample_weight=sample_weight)
+        self.model_type = "sklearn"
+
+    def save(self):
+        if self.base_model is not None and self.model_type == "sklearn":
+            joblib.dump(
+                {
+                    "model_type": self.model_type,
+                    "feature_columns": self.feature_columns,
+                    "model": self.base_model,
+                },
+                MODEL_BUNDLE_PATH,
+            )
+        else:
+            torch.save(self.model.state_dict(), MODEL_WEIGHTS_PATH)
+        joblib.dump(self.calibrator, CALIBRATOR_PATH)
+
     def predict_raw_proba(self, X):
+        if self.base_model is not None and self.model_type == "sklearn":
+            if isinstance(X, torch.Tensor):
+                X = X.detach().cpu().numpy()
+            else:
+                X = np.asarray(X, dtype=np.float32)
+            return self.base_model.predict_proba(X)[:, 1]
+
         self.model.eval()
         with torch.no_grad():
             return self.model(X.to(self.device)).cpu().numpy()

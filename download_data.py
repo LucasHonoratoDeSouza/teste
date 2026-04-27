@@ -1,9 +1,12 @@
-import requests
-import pandas as pd
+import argparse
 import time
 from datetime import datetime
 
-def download_1s_klines(symbol='BTCUSDT', hours=24):
+import pandas as pd
+import requests
+
+
+def download_1s_klines(symbol='BTCUSDT', hours=24, output_path="historical_1s.csv"):
     print(f"Baixando {hours} horas de dados históricos de 1 segundo para {symbol}...")
     limit = 1000
     end_time = int(time.time() * 1000)
@@ -15,7 +18,7 @@ def download_1s_klines(symbol='BTCUSDT', hours=24):
     while current_start < end_time:
         try:
             url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1s&startTime={current_start}&limit={limit}"
-            res = requests.get(url)
+            res = requests.get(url, timeout=10)
             data = res.json()
             if not data or type(data) is dict: # Error dict
                 break
@@ -36,8 +39,18 @@ def download_1s_klines(symbol='BTCUSDT', hours=24):
     df['ask_vol'] = df['volume'].astype(float) - df['bid_vol']
     
     df = df[['timestamp', 'price', 'bid_vol', 'ask_vol']]
-    df.to_csv("historical_1s.csv", index=False)
-    print("Download concluído! Salvo em historical_1s.csv")
+    df.to_csv(output_path, index=False)
+    print(f"Download concluído! Salvo em {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Baixa klines Binance 1s para treino do bot.")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--hours", type=int, default=24)
+    parser.add_argument("--output-path", default="historical_1s.csv")
+    args = parser.parse_args()
+    download_1s_klines(symbol=args.symbol, hours=args.hours, output_path=args.output_path)
+
 
 if __name__ == "__main__":
-    download_1s_klines(hours=24) # Baixa as últimas 24 horas (~86.400 linhas)
+    main()

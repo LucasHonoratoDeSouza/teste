@@ -1,92 +1,63 @@
 import pandas as pd
 import numpy as np
-import torch
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+
+from features import MODEL_FEATURE_COLUMNS
 from model import ModelEngine
-from features import FeatureEngineer
-from config import TRAIN_WINDOW_HOURS, TEST_WINDOW_HOURS, SLIPPAGE_CENTS_PER_500, EXECUTION_DELAY_SEC
+from train_model import prepare_training_data
+
 
 class WalkForwardBacktester:
-    def __init__(self, data_df):
-        """
-        data_df: Dados históricos contendo: 
-        timestamp, price, bid_vol, ask_vol, polymarket_price, S0, expiry_time
-        """
-        self.data = data_df.copy()
-        self.data.set_index('timestamp', inplace=True)
-        self.fe = FeatureEngineer()
-        
+    def __init__(self, csv_path="historical_1s.csv", sample_every_seconds=5, train_rounds=120, test_rounds=24):
+        self.data = prepare_training_data(csv_path=csv_path, sample_every_seconds=sample_every_seconds)
+        self.train_rounds = train_rounds
+        self.test_rounds = test_rounds
+
     def run(self):
-        print("Iniciando Walk-Forward Backtest...")
-        
-        # Gera todas as features de forma vetorizada
-        df_features = self.fe.build_backtest_features(
-            self.data, 
-            self.data['S0'], 
-            self.data['expiry_time']
-        )
-        
-        # Simula label true (1 se preço_final > S0, 0 caso contrário)
-        # Vamos assumir que os dados já contém 'true_label' ou nós os calculamos
-        
-        feature_cols = [c for c in df_features.columns if c not in ['price', 'bid_vol', 'ask_vol', 'polymarket_price', 'S0', 'expiry_time', 'true_label']]
-        
-        start_time = df_features.index.min()
-        end_time = df_features.index.max()
-        
-        current_time = start_time + pd.Timedelta(hours=TRAIN_WINDOW_HOURS)
-        
-        results = []
-        
-        while current_time + pd.Timedelta(hours=TEST_WINDOW_HOURS) <= end_time:
-            train_start = current_time - pd.Timedelta(hours=TRAIN_WINDOW_HOURS)
-            test_end = current_time + pd.Timedelta(hours=TEST_WINDOW_HOURS)
-            
-            train_df = df_features[(df_features.index >= train_start) & (df_features.index < current_time)]
-            test_df = df_features[(df_features.index >= current_time) & (df_features.index < test_end)]
-            
-            if len(train_df) < 1000 or len(test_df) == 0:
-                current_time += pd.Timedelta(hours=TEST_WINDOW_HOURS)
-                continue
-                
-            model = ModelEngine(input_dim=len(feature_cols))
-            
-            X_train = torch.tensor(train_df[feature_cols].values, dtype=torch.float32)
-            y_train = torch.tensor(train_df['true_label'].values, dtype=torch.float32)
-            p_mkt_train = torch.tensor(train_df['implied_prob'].values, dtype=torch.float32)
-            
-            # Treino
-            model.train_epoch(X_train, y_train, p_mkt_train)
-            model.fit_calibrator(X_train, y_train) # Na prática devia ser hold-out set
-            
-            # Teste
-            X_test = torch.tensor(test_df[feature_cols].values, dtype=torch.float32)
-            test_df['P_model'] = model.predict_proba(X_test)
-            
-            # Simulação de Slippage/Delay e Execução
-            test_df['delayed_implied_prob'] = test_df['implied_prob'].shift(-EXECUTION_DELAY_SEC)
-            test_df.dropna(inplace=True)
-            
-            # Condição: Valor Esperado (EV) > 0
-            # EV = (P_model * Payout) - Custo
-            # Payout = 1 se ganha. Custo = P_mkt + slippage
-            test_df['slippage'] = (500 / 500) * SLIPPAGE_CENTS_PER_500 # Simplificando para aposta de $500
-            test_df['cost'] = test_df['delayed_implied_prob'] + test_df['slippage']
-            test_df['EV'] = test_df['P_model'] * 1.0 - test_df['cost']
-            
-            # Trades onde EV > Margin
-            margin = 0.05
-            trades = test_df[test_df['P_model'] > test_df['cost'] + margin]
-            
-            # Calcular PnL
-            trades['PnL'] = np.where(trades['true_label'] == 1, 1.0 - trades['cost'], -trades['cost'])
-            results.append(trades)
-            
-            current_time += pd.Timedelta(hours=TEST_WINDOW_HOURS)
-            
-        if results:
-            all_trades = pd.concat(results)
-            print(f"Total Trades: {len(all_trades)}")
-            print(f"Total PnL: {all_trades['PnL'].sum():.2f}")
-            print(f"Win Rate: {(all_trades['PnL'] > 0).mean():.2%}")
-            return all_trades
-        return None
+        print("Iniciando walk-forward backtest quantitativo...")
+        rounds = sorted(self.data["expiry_time"].unique())
+        if len(rounds) < self.train_rounds + self.test_rounds:
+            raise ValueError("Histórico insuficiente para o walk-forward configurado.")
+
+        all_predictions = []
+
+        start_idx = self.train_rounds
+        while start_idx + self.test_rounds <= len(rounds):
+            train_round_list = rounds[start_idx - self.train_rounds:start_idx]
+            train_slice = set(train_round_list)
+            test_slice = set(rounds[start_idx:start_idx + self.test_rounds])
+
+            train_df = self.data[self.data["expiry_time"].isin(train_slice)].copy()
+            split_point = int(len(train_round_list) * 0.8)
+            calib_rounds = set(train_round_list[split_point:])
+            fit_rounds = train_slice - calib_rounds
+            fit_df = train_df[train_df["expiry_time"].isin(fit_rounds)].copy()
+            calib_df = train_df[train_df["expiry_time"].isin(calib_rounds)].copy()
+            test_df = self.data[self.data["expiry_time"].isin(test_slice)].copy()
+
+            model_engine = ModelEngine(input_dim=len(MODEL_FEATURE_COLUMNS), load_existing=False)
+            model_engine.feature_columns = list(MODEL_FEATURE_COLUMNS)
+            model_engine.fit_sklearn_model(
+                fit_df[MODEL_FEATURE_COLUMNS].values,
+                fit_df["true_label"].values,
+                sample_weight=fit_df["round_weight"].values,
+            )
+
+            calib_raw = model_engine.predict_raw_proba(calib_df[MODEL_FEATURE_COLUMNS].values)
+            model_engine.fit_calibrator_from_raw(calib_raw, calib_df["true_label"].values)
+
+            test_df["P_model"] = model_engine.predict_proba(test_df[MODEL_FEATURE_COLUMNS].values)
+            all_predictions.append(test_df[["expiry_time", "true_label", "P_model"]])
+
+            start_idx += self.test_rounds
+
+        predictions = pd.concat(all_predictions, ignore_index=True)
+        y_true = predictions["true_label"].values
+        probs = np.clip(predictions["P_model"].values, 1e-6, 1 - 1e-6)
+
+        print(f"Amostras avaliadas: {len(predictions)}")
+        print(f"Brier Score : {brier_score_loss(y_true, probs):.4f}")
+        print(f"AUC         : {roc_auc_score(y_true, probs):.4f}")
+        print(f"Log Loss    : {log_loss(y_true, probs):.4f}")
+        print(f"Accuracy    : {accuracy_score(y_true, probs >= 0.5):.4f}")
+        return predictions

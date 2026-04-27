@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+from backtest import WalkForwardBacktester
+from features import MODEL_FEATURE_COLUMNS
 from forward_test import ForwardTestEngine
 from model import ModelEngine
 
@@ -18,17 +20,12 @@ def main():
     args = parser.parse_args()
     
     if args.mode == 'backtest':
-        print("Para o backtest, seria necessário carregar dados históricos primeiro.")
-        print("Isso deve ser feito rodando scripts de dump do Binance / CCXT.")
-        print("Consulte backtest.py para executar na base gerada.")
+        backtester = WalkForwardBacktester()
+        backtester.run()
         
     elif args.mode == 'forward':
-        # Instancia modelo (Idealmente carregar pesos pré-treinados aqui)
-        # Assumindo 10 features do FeatureEngineer:
-        # time_to_expiry, distance_to_strike, obi, implied_prob, 
-        # log_return(10,30,60,300), volatility(10,30,60,300) -> 12 features
         print("Inicializando Modelo...")
-        model = ModelEngine(input_dim=12)
+        model = ModelEngine(input_dim=len(MODEL_FEATURE_COLUMNS))
         
         forward_engine = ForwardTestEngine(
             model,
