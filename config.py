@@ -1,0 +1,50 @@
+import os
+
+# API Parameters
+BINANCE_SYMBOL = "btcusdt"
+CHAINLINK_SYMBOL = "btc/usd"
+POLYMARKET_SERIES_SLUG = "btc-updown-5m"
+POLYMARKET_RECURRENCE_SECONDS = 5 * 60
+POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
+POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
+POLYMARKET_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+REQUEST_TIMEOUT = 5
+BINANCE_WS_URL = f"wss://stream.binance.com:9443/ws/{BINANCE_SYMBOL}@trade/{BINANCE_SYMBOL}@depth20@100ms"
+
+# Model Parameters
+LR = 1e-3
+WEIGHT_DECAY = 1e-3
+BATCH_SIZE = 256
+EPOCHS = 10
+
+# Backtest Parameters
+TRAIN_WINDOW_HOURS = 4
+TEST_WINDOW_HOURS = 1
+SLIPPAGE_CENTS_PER_500 = 0.01
+EXECUTION_DELAY_SEC = 2
+
+# Forward Test Parameters
+KELLY_FRACTION = 0.25
+MAX_SPREAD_PERCENT = 0.05
+MIN_EDGE = 0.05
+PAPER_BANKROLL_USD = 1000.0
+BET_COOLDOWN_SECONDS = 30
+BOOK_REFRESH_SECONDS = 5
+MIN_ENTRY_TIME_TO_EXPIRY_SECONDS = 45
+MAX_ENTRY_PRICE = 0.90
+MAX_OPEN_BETS_PER_MARKET = 2
+MAX_OPEN_BETS_PER_OUTCOME = 1
+MAX_OPEN_RISK_PER_MARKET_USD = 250.0
+LOCK_PROFIT_TIME_TO_EXPIRY_SECONDS = 75
+LOCK_PROFIT_BID = 0.98
+MIN_HOLD_BEFORE_SELL_SECONDS = 60
+SELL_OVERPRICED_EDGE = 0.12
+
+# Online adaptation: recalibrates probabilities with live resolved rounds, but
+# keeps neural-network weights frozen to avoid noisy overfitting mid-session.
+ONLINE_CALIBRATION_ENABLED = True
+ONLINE_CALIBRATION_MIN_SAMPLES = 900
+ONLINE_CALIBRATION_MIN_ROUNDS = 4
+ONLINE_CALIBRATION_WINDOW_SAMPLES = 7200
+DB_PATH = "sqlite:///forward_test_logs.db"
