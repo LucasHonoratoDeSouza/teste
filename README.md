@@ -41,7 +41,7 @@ Se o bot iniciar tarde demais dentro de uma rodada e não houver alvo Chainlink 
 - Não compra acima de `MAX_ENTRY_PRICE` para evitar pegar contratos de 99c com pouco upside e cauda grande.
 - Simula o fill usando a profundidade real do book, não assume liquidez infinita no melhor ask.
 - Limita posições abertas por rodada e por outcome para evitar piramidar a mesma ideia várias vezes.
-- Vende pelo bid antes do vencimento só em caso conservador: lucro quase travado perto do fim, ou quando o bid está muito acima da probabilidade estimada pelo modelo. Não há stop-loss agressivo por oscilação curta.
+- Vende pelo bid antes do vencimento só em caso conservador: lucro quase travado perto do fim. A saída `SOLD_OVERPRICED` fica desligada por padrão; se for reativada em `config.py`, ela só vende com PnL positivo.
 
 ## Rodar por muitas horas
 

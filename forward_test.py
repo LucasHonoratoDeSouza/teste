@@ -27,6 +27,8 @@ from config import (
     ONLINE_CALIBRATION_WINDOW_SAMPLES,
     PAPER_BANKROLL_USD,
     SELL_OVERPRICED_EDGE,
+    SELL_OVERPRICED_ENABLED,
+    SELL_OVERPRICED_MIN_PNL_USD,
 )
 from data_engine import DataEngine, utc_now
 from features import FeatureEngineer
@@ -390,6 +392,10 @@ class ForwardTestEngine:
         if seconds_left <= LOCK_PROFIT_TIME_TO_EXPIRY_SECONDS and exit_bid >= LOCK_PROFIT_BID and pnl > 0:
             return "SOLD_LOCK_PROFIT"
         if held_seconds < MIN_HOLD_BEFORE_SELL_SECONDS:
+            return None
+        if not SELL_OVERPRICED_ENABLED:
+            return None
+        if pnl <= SELL_OVERPRICED_MIN_PNL_USD:
             return None
         if exit_bid >= held_model_prob + SELL_OVERPRICED_EDGE:
             return "SOLD_OVERPRICED"
