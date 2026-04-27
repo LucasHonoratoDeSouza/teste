@@ -5,3 +5,4 @@ __pycache__/
 status*.json
 .DS_Store
 .codex
+venv/
